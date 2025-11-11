@@ -293,26 +293,41 @@ class MatcheadorFacturas:
             print(f"Operaciones válidas para matcheo: {len(self.banco_df)}")
         
         return True
+
+    def _normalizar_nombre_sin_espacios(self, nombre):
+        """Normalizar nombre removiendo espacios y caracteres especiales"""
+        if pd.isna(nombre) or nombre == '':
+            return ''
+        
+        # Convertir a mayúsculas y remover acentos
+        nombre_str = str(nombre).upper().strip()
+        nombre_str = unicodedata.normalize('NFKD', nombre_str)
+        nombre_str = ''.join(ch for ch in nombre_str if not unicodedata.combining(ch))
+            
+        # Remover todo excepto letras y números, luego eliminar espacios
+        nombre_str = re.sub(r'[^A-Z0-9]', '', nombre_str)
+            
+        return nombre_str
+
+    def _normalize_to_token_set(self, text):
+        """Función auxiliar para normalizar texto a tokens"""
+        if pd.isna(text) or text == '':
+            return frozenset()
+        # Normalizar acentos y caracteres, dejar solo letras/dígitos y espacios
+        s = str(text).upper().strip()
+        s = unicodedata.normalize('NFKD', s)
+        s = ''.join(ch for ch in s if not unicodedata.combining(ch))
+        # Reemplazar caracteres no alfanuméricos por espacio
+        s = re.sub(r'[^A-Z0-9\s]', ' ', s)
+        tokens = [tok for tok in s.split() if tok]
+        return frozenset(tokens)
     
     def _obtener_familia_por_persona(self, nombre_persona):
         """Buscar a qué familia pertenece una persona"""
         if pd.isna(nombre_persona) or nombre_persona == '':
             return 'No identificada'
 
-        # Normalizar y tokenizar nombres para comparar sin importar el orden
-        def _normalize_to_token_set(text):
-            if pd.isna(text) or text == '':
-                return frozenset()
-            # Normalizar acentos y caracteres, dejar solo letras/dígitos y espacios
-            s = str(text).upper().strip()
-            s = unicodedata.normalize('NFKD', s)
-            s = ''.join(ch for ch in s if not unicodedata.combining(ch))
-            # Reemplazar caracteres no alfanuméricos por espacio
-            s = re.sub(r'[^A-Z0-9\s]', ' ', s)
-            tokens = [tok for tok in s.split() if tok]
-            return frozenset(tokens)
-
-        nombre_buscar_tokens = _normalize_to_token_set(nombre_persona)
+        nombre_buscar_tokens = self._normalize_to_token_set(nombre_persona)
 
         # Obtener todas las columnas que contienen personas
         columnas_persona = [col for col in self.familias_df.columns if 'persona' in col.lower()]
@@ -322,7 +337,7 @@ class MatcheadorFacturas:
             # Revisar todas las columnas de personas
             for col in columnas_persona:
                 if pd.notna(familia[col]):
-                    valor_celda_tokens = _normalize_to_token_set(familia[col])
+                    valor_celda_tokens = self._normalize_to_token_set(familia[col])
                     if not valor_celda_tokens:
                         continue
                     # Coincidencia si los tokens son exactamente iguales
@@ -333,7 +348,6 @@ class MatcheadorFacturas:
                         return familia['Código']
 
         return 'No encontrada'
-    
 
     def matcheo_exacto(self):
         """Realizar matcheo exacto por fecha, nombre y monto"""
@@ -422,22 +436,131 @@ class MatcheadorFacturas:
         
         return self.resultados
 
+    def matcheo_sin_espacios(self):
+        """Matcheo para casos donde los nombres en banco no tienen espacios"""
+        
+        print("\n" + "="*50)
+        print("INICIANDO MATCHEO SIN ESPACIOS")
+        print("="*50)
+        
+        # Verificar que tenemos los datos necesarios
+        columnas_requeridas_banco = ['Fecha', 'Nombre', 'Monto']
+        for col in columnas_requeridas_banco:
+            if col not in self.banco_df.columns:
+                print(f"❌ ERROR: Columna '{col}' no encontrada en banco")
+                return None
+        
+        if self.resultados is None:
+            self.resultados = pd.DataFrame()
+        
+        # Identificar operaciones ya matcheadas
+        ops_matcheadas = set()
+        if len(self.resultados) > 0:
+            for _, r in self.resultados.iterrows():
+                try:
+                    fecha_b = pd.to_datetime(r['Fecha_Banco'])
+                except Exception:
+                    fecha_b = r['Fecha_Banco']
+                nombre_b = self._normalizar_nombre_sin_espacios(r['Nombre_Banco'])
+                monto_b = float(r['Monto_Banco'])
+                ops_matcheadas.add((fecha_b, nombre_b, monto_b))
+        
+        # Identificar facturas ya matcheadas
+        facturas_matcheadas = set()
+        if len(self.resultados) > 0:
+            for val in self.resultados['Factura'].dropna().astype(str):
+                for f in [x.strip() for x in val.split(',') if x.strip()]:
+                    facturas_matcheadas.add(f)
+        
+        matches_nuevos = []
+        matches_encontrados = 0
+        
+        # Preparar ventas no matcheadas
+        ventas_sin_match = self.ventas_df[
+            ~self.ventas_df['Factura'].astype(str).isin(facturas_matcheadas)
+        ].dropna(subset=['Fecha', 'Nombre_Cliente', 'Monto']).copy()
+        
+        print(f"Ventas disponibles para matcheo sin espacios: {len(ventas_sin_match)}")
+        print(f"Operaciones bancarias disponibles: {len(self.banco_df)}")
+        
+        # Precomputar nombres normalizados para ventas
+        ventas_sin_match['Nombre_Normalizado'] = ventas_sin_match['Nombre_Cliente'].apply(
+            self._normalizar_nombre_sin_espacios
+        )
+        
+        # Procesar cada operación bancaria no matcheada
+        for idx, banco in self.banco_df.iterrows():
+            if idx % 100 == 0:
+                print(f"Procesando operación bancaria {idx + 1}/{len(self.banco_df)}")
+            
+            # Verificar si ya está matcheada
+            try:
+                fecha_b = pd.to_datetime(banco['Fecha'])
+            except Exception:
+                fecha_b = banco['Fecha']
+            
+            nombre_b_normalizado = self._normalizar_nombre_sin_espacios(banco['Nombre'])
+            monto_b = float(banco['Monto'])
+            
+            if (fecha_b, nombre_b_normalizado, monto_b) in ops_matcheadas:
+                continue
+            
+            # Buscar coincidencias en ventas
+            mask = (
+                (ventas_sin_match['Fecha'] == fecha_b) &
+                (ventas_sin_match['Nombre_Normalizado'] == nombre_b_normalizado) &
+                (ventas_sin_match['Monto'] == monto_b)
+            )
+            
+            coincidencias = ventas_sin_match[mask]
+            
+            for _, venta in coincidencias.iterrows():
+                # Obtener familia
+                familia = self._obtener_familia_por_persona(venta['Nombre_Cliente'])
+                
+                matches_nuevos.append({
+                    'Detalle_Banco': banco.get('Detalle', ''),
+                    'Familia': familia,
+                    'Codigo_Familia': familia if familia != 'No encontrada' else '',
+                    'Factura': venta.get('Factura', ''),
+                    'Numero_Caja': venta.get('Numero_Caja', ''),
+                    'Fecha_Factura': venta['Fecha'],
+                    'Fecha_Banco': banco['Fecha'],
+                    'Nombre_Banco': banco['Nombre'],
+                    'Cliente_Factura': venta['Nombre_Cliente'],
+                    'Monto_Banco': banco['Monto'],
+                    'Monto_Factura': venta['Monto'],
+                    'Comprobante_Banco': banco.get('Comprobante', ''),
+                    'Concepto_Banco': banco.get('Concepto', ''),
+                    'Tipo_Match': 'SIN_ESPACIOS',
+                    'Coincidencia': '100%',
+                    'Estado': 'MATCH_SIN_ESPACIOS',
+                    'Notas': f"Nombre original banco: '{banco['Nombre']}' -> Cliente: '{venta['Nombre_Cliente']}'"
+                })
+                
+                matches_encontrados += 1
+                # Marcar como usado
+                ops_matcheadas.add((fecha_b, nombre_b_normalizado, monto_b))
+                break
+        
+        # Agregar nuevos matches
+        if matches_nuevos:
+            df_nuevos = pd.DataFrame(matches_nuevos)
+            self.resultados = pd.concat([self.resultados, df_nuevos], ignore_index=True)
+            print(f"✓ Matches sin espacios encontrados: {matches_encontrados}")
+            
+            # Mostrar algunos ejemplos
+            print(f"\nEjemplos de matches sin espacios:")
+            for match in matches_nuevos[:3]:
+                print(f"  Banco: '{match['Nombre_Banco']}' -> Cliente: '{match['Cliente_Factura']}'")
+        
+        return self.resultados
+
     def matcheo_multifacturas_misma_familia_dia_caja(self):
         """Matcheo donde se agrupan facturas que cumplan TODAS estas condiciones:
         1. MISMA FAMILIA (mismo código de familia)
         2. MISMO DÍA (fecha exacta)
         3. MISMA CAJA (mismo número de caja)
-        
-        El proceso:
-        1. Agrupa facturas que cumplan las 3 condiciones
-        2. Suma los montos del grupo
-        3. Busca operación bancaria que coincida en:
-           - Monto total
-           - Fecha exacta
-           - Familia del pagante (debe ser la misma familia del grupo)
-
-        Suposición: nos enfocamos en grupos con 2 o más facturas (agrupamientos que no fueron
-        resueltos por el matcheo exacto).
         """
         # Verificar columnas necesarias
         columnas_requeridas_banco = ['Fecha', 'Nombre', 'Monto']
@@ -456,10 +579,6 @@ class MatcheadorFacturas:
         print("\n" + "="*50)
         print("INICIANDO MATCHEO MULTI-FACTURAS (MISMA FAMILIA + MISMO DÍA + MISMA CAJA)")
         print("="*50)
-        print("Condiciones requeridas:")
-        print("1. Facturas de la MISMA FAMILIA")
-        print("2. Facturas del MISMO DÍA")
-        print("3. Facturas de la MISMA CAJA")
 
         # Construir conjunto de operaciones bancarias ya matcheadas para evitar reuse
         matched_ops = set()
@@ -474,14 +593,12 @@ class MatcheadorFacturas:
                     monto_b = float(r.get('Monto_Banco'))
                 except Exception:
                     monto_b = r.get('Monto_Banco')
-
                 matched_ops.add((fecha_b, nombre_b, monto_b))
 
         # Identificar facturas ya matcheadas
         facturas_matcheadas = set()
         if self.resultados is not None and len(self.resultados) > 0:
             for val in self.resultados['Factura'].dropna().astype(str):
-                # dividir por comas por si hay facturas múltiples
                 facturas_matcheadas.update([x.strip() for x in val.split(',') if x.strip()])
         
         # Preparar ventas válidas, excluyendo las ya matcheadas
@@ -714,199 +831,6 @@ class MatcheadorFacturas:
 
         return self.resultados
 
-    def matcheo_multifacturas_misma_familia_mismo_dia_caja(self):
-        """Matcheo inteligente por familia: para cada pago en el banco, busca combinaciones de
-        2 o más facturas de la misma familia que SUMEN el monto del pago bancario.
-        
-        Proceso:
-        1. Para cada operación bancaria:
-           - Identifica la familia del pagador (usando familias_df)
-           - Si no encuentra familia, intenta por apellido o nombre exacto
-        2. Busca facturas de esa familia:
-           - Prioriza facturas cercanas en fecha al pago
-           - Considera grupos de 2 a 8 facturas
-           - Suma los montos y compara con el pago (tolerancia ±0.01)
-        3. Al encontrar match:
-           - Marca las facturas como usadas
-           - Registra el match con detalles de todas las facturas
-
-        Ejemplo:
-        Si el banco tiene un pago de $1000 de la familia "PEREZ":
-        - Busca facturas de la familia PEREZ
-        - Podría encontrar: factura1=$300, factura2=$400, factura3=$300
-        - Total facturas = $1000 = monto del banco -> MATCH!
-        
-        Nota: Las facturas se ordenan por cercanía en fecha al pago bancario
-        para favorecer agrupaciones temporalmente cercanas.
-        """
-        # Nuevo enfoque: iterar por operaciones bancarias, identificar la familia desde el nombre
-        # del banco y luego buscar en ventas 2 o más facturas pertenecientes a esa familia cuya
-        # suma de montos sea igual al monto de la operación bancaria.
-        if self.familias_df is None:
-            print("❌ ERROR: No hay datos de familias cargados para matcheo por familia")
-            return None
-
-        columnas_requeridas_banco = ['Fecha', 'Nombre', 'Monto']
-        for col in columnas_requeridas_banco:
-            if col not in self.banco_df.columns:
-                print(f"❌ ERROR: No se puede realizar matcheo multi-familia - Columna '{col}' no encontrada en banco")
-                return None
-
-        # Preparar ventas válidas y columna con código de familia
-        ventas_validas = self.ventas_df.dropna(subset=['Fecha', 'Nombre_Cliente', 'Monto']).copy()
-        if 'Codigo_Familia_Venta' not in ventas_validas.columns:
-            ventas_validas['Codigo_Familia_Venta'] = ventas_validas['Nombre_Cliente'].apply(self._obtener_familia_por_persona)
-
-        # Flag para evitar reutilizar la misma factura en múltiples matches
-        ventas_validas['_usado_en_match'] = False
-
-        matches_nuevos = []
-        matches_encontrados = 0
-
-        # Conjunto de operaciones bancarias ya usadas
-        matched_ops = set()
-        if self.resultados is not None and len(self.resultados) > 0:
-            for _, r in self.resultados.iterrows():
-                try:
-                    fecha_b = pd.to_datetime(r.get('Fecha_Banco'))
-                except Exception:
-                    fecha_b = r.get('Fecha_Banco')
-                nombre_b = str(r.get('Nombre_Banco', '')).upper().strip()
-                try:
-                    monto_b = float(r.get('Monto_Banco'))
-                except Exception:
-                    monto_b = r.get('Monto_Banco')
-                matched_ops.add((fecha_b, nombre_b, monto_b))
-
-        # Función auxiliar para extraer apellido/clave
-        def extraer_apellido(nombre):
-            if pd.isna(nombre):
-                return ''
-            partes = str(nombre).upper().strip().split()
-            return partes[-1] if len(partes) > 0 else ''
-
-        # Tolerancia para comparación de montos
-        TOL = 0.01
-
-        # Iterar por cada operación bancaria
-        for _, banco in self.banco_df.iterrows():
-            try:
-                fecha_b = pd.to_datetime(banco['Fecha'])
-            except Exception:
-                fecha_b = banco['Fecha']
-
-            nombre_banco = str(banco['Nombre']).upper().strip() if pd.notna(banco['Nombre']) else ''
-            monto_banco = float(banco['Monto']) if pd.notna(banco['Monto']) else 0.0
-
-            if (fecha_b, nombre_banco, monto_banco) in matched_ops:
-                continue
-
-            # Identificar familia a partir del nombre en el banco
-            codigo_familia_banco = self._obtener_familia_por_persona(banco['Nombre'])
-
-            # Filtrar candidatos en ventas por familia
-            if codigo_familia_banco not in ['No encontrada', 'No identificada', None, '']:
-                # Buscar todas las facturas no usadas de la misma familia
-                candidatos = ventas_validas[
-                    (ventas_validas['Codigo_Familia_Venta'] == codigo_familia_banco) &
-                    (~ventas_validas['_usado_en_match'])
-                ].copy()
-            else:
-                # Si no se identificó familia, intentar usar apellido del nombre del banco
-                clave = extraer_apellido(banco['Nombre'])
-                if clave == '':
-                    # Si no hay clave de familia, buscar por coincidencia exacta de nombre
-                    candidatos = ventas_validas[
-                        (ventas_validas['Nombre_Cliente'].str.upper().strip() == nombre_banco) &
-                        (~ventas_validas['_usado_en_match'])
-                    ].copy()
-                else:
-                    # Buscar por apellido en el nombre del cliente
-                    candidatos = ventas_validas[
-                        (ventas_validas['Nombre_Cliente'].str.upper().str.contains(clave)) &
-                        (~ventas_validas['_usado_en_match'])
-                    ].copy()
-
-            # No hay suficientes candidatos -> continuar
-            if len(candidatos) < 2:
-                continue
-
-            # Ordenar candidatos por fecha para priorizar facturas cercanas en el tiempo
-            candidatos = candidatos.sort_values('Fecha')
-
-            # Para evitar combinatoria excesiva, limitamos el tamaño del conjunto a considerar
-            # Primero intentamos con facturas cercanas en fecha al registro del banco
-            candidatos['diff_dias'] = abs((candidatos['Fecha'] - fecha_b).dt.days)
-            
-            # Ordenar por diferencia de días (priorizar cercanas) y luego por monto (descendente)
-            candidatos = candidatos.sort_values(['diff_dias', 'Monto'], 
-                                              ascending=[True, False]).reset_index(drop=True)
-            
-            # Limitar a los primeros N candidatos más cercanos en fecha para combinaciones
-            MAX_CANDIDATOS = 15  # Aumentado para dar más flexibilidad a las combinaciones
-            candidatos_restringidos = candidatos.head(MAX_CANDIDATOS)
-
-            # Buscar combinaciones de 2..k facturas que sumen el monto del banco
-            from itertools import combinations
-
-            encontrados_para_banco = False
-            max_k = min(8, len(candidatos_restringidos))  # Permitir hasta 8 facturas por grupo
-            for k in range(2, max_k + 1):
-                if encontrados_para_banco:
-                    break
-                for combo in combinations(range(len(candidatos_restringidos)), k):
-                    idxs = list(combo)
-                    subset = candidatos_restringidos.loc[idxs]
-                    suma = float(subset['Monto'].sum())
-                    
-                    # Verificar si la suma de facturas es igual al monto del banco
-                    if abs(suma - monto_banco) <= TOL:
-                        # Registrar match
-                        facturas = subset['Factura'].astype(str).tolist()
-                        numero_cajas = subset['Numero_Caja'].astype(str).unique().tolist()
-                        cantidad_facturas = len(facturas)
-
-                        matches_nuevos.append({
-                            'Detalle_Banco': banco.get('Detalle', ''),
-                            'Familia': codigo_familia_banco,
-                            'Codigo_Familia': codigo_familia_banco if codigo_familia_banco not in ['No encontrada', 'No identificada'] else '',
-                            'Factura': ",".join(facturas),
-                            'Numero_Caja': ",".join(numero_cajas),
-                            'Fecha_Factura': ",".join([str(x) for x in subset['Fecha'].dt.strftime('%Y-%m-%d').unique()]) if pd.api.types.is_datetime64_any_dtype(subset['Fecha']) else ",".join([str(x) for x in subset['Fecha'].unique()]),
-                            'Fecha_Banco': banco['Fecha'],
-                            'Nombre_Banco': banco['Nombre'],
-                            'Cliente_Factura': ";".join(sorted(subset['Nombre_Cliente'].astype(str).str.upper().unique())),
-                            'Monto_Banco': banco['Monto'],
-                            'Monto_Factura': suma,
-                            'Comprobante_Banco': banco.get('Comprobante', ''),
-                            'Concepto_Banco': banco.get('Concepto', ''),
-                            'Tipo_Match': 'MULTI_FACTURAS_FAMILIA_BANCO_PRIMERO',
-                            'Coincidencia': 'AGREGADO',
-                            'Estado': 'MATCH_MULTI_FACTURAS_FAMILIA',
-                            'Cantidad_Facturas': cantidad_facturas,
-                            'Facturas_Agrupadas': ",".join(facturas)
-                        })
-
-                        # Marcar facturas como usadas y la operación bancaria como matcheada
-                        ventas_validas.loc[subset.index, '_usado_en_match'] = True
-                        matched_ops.add((fecha_b, nombre_banco, monto_banco))
-                        matches_encontrados += 1
-                        encontrados_para_banco = True
-                        break
-
-            # continuar con la siguiente operación bancaria
-
-        # Agregar nuevos matches a resultados
-        if len(matches_nuevos) > 0:
-            df_nuevos = pd.DataFrame(matches_nuevos)
-            if self.resultados is None or len(self.resultados) == 0:
-                self.resultados = df_nuevos
-            else:
-                self.resultados = pd.concat([self.resultados, df_nuevos], ignore_index=True)
-
-        print(f"- Matches multi-familia (banco->familia->ventas) encontrados: {matches_encontrados}")
-        return self.resultados
-    
     def generar_reporte_completo(self, archivo_salida):
         """Generar reporte Excel completo con múltiples hojas"""
         if self.resultados is None or len(self.resultados) == 0:
@@ -922,10 +846,11 @@ class MatcheadorFacturas:
                 if 'Tipo_Match' in self.resultados.columns and 'MULTI_FACTURAS' in self.resultados['Tipo_Match'].unique():
                     multi_df = self.resultados[self.resultados['Tipo_Match'] == 'MULTI_FACTURAS']
                     multi_df.to_excel(writer, sheet_name='Matches_MultiFacturas', index=False)
-                # Matches multi-familia (si existen)
-                if 'Tipo_Match' in self.resultados.columns and 'MULTI_FACTURAS_FAMILIA' in self.resultados['Tipo_Match'].unique():
-                    fam_df = self.resultados[self.resultados['Tipo_Match'] == 'MULTI_FACTURAS_FAMILIA']
-                    fam_df.to_excel(writer, sheet_name='Matches_MultiFacturas_Familia', index=False)
+                
+                # Matches sin espacios (si existen)
+                if 'Tipo_Match' in self.resultados.columns and 'SIN_ESPACIOS' in self.resultados['Tipo_Match'].unique():
+                    sin_espacios_df = self.resultados[self.resultados['Tipo_Match'] == 'SIN_ESPACIOS']
+                    sin_espacios_df.to_excel(writer, sheet_name='Matches_Sin_Espacios', index=False)
                 
                 # 2. Resumen por familia
                 resumen_familias = self.resultados.groupby('Familia').agg({
@@ -942,11 +867,9 @@ class MatcheadorFacturas:
                 resumen_cajas.to_excel(writer, sheet_name='Resumen_Cajas')
                 
                 # 4. Facturas sin match
-                # Tener en cuenta que para matches multi-facturas 'Factura' puede contener varias facturas separadas por comas
                 facturas_con_match = set()
                 if 'Factura' in self.resultados.columns:
                     for val in self.resultados['Factura'].dropna().astype(str).unique():
-                        # dividir por comas y limpiar espacios
                         for f in [x.strip() for x in val.split(',') if x.strip() != '']:
                             facturas_con_match.add(f)
 
@@ -993,6 +916,13 @@ class MatcheadorFacturas:
             print(f"Operaciones con match: {operaciones_matcheadas}")
             print(f"Tasa de match operaciones: {(operaciones_matcheadas/total_operaciones)*100:.2f}%")
             print(f"Total montos matcheados: ${self.resultados['Monto_Factura'].sum():,.2f}")
+            
+            # Estadísticas por tipo de match
+            if 'Tipo_Match' in self.resultados.columns:
+                print(f"\nDistribución por tipo de match:")
+                stats_tipos = self.resultados['Tipo_Match'].value_counts()
+                for tipo, count in stats_tipos.items():
+                    print(f"  {tipo}: {count} matches")
             
             # Estadísticas por familia
             print(f"\nTop 10 familias con más matches:")
@@ -1047,29 +977,33 @@ def ejecutar_matcheo():
             print("❌ ERROR: No se pudo cargar el archivo de banco")
             return None
         
-        # Realizar matcheo exacto
-        print("\nRealizando matcheo exacto...")
+        # NUEVA SECUENCIA DE MATCHEOS:
+        print("\n1. Realizando matcheo exacto...")
         resultados = matcheador.matcheo_exacto()
         
-        if resultados is not None:
-            # Intentar matcheo por multi-facturas (misma familia + mismo día + misma caja)
-            print("\nRealizando matcheo multi-facturas (misma familia + mismo día + misma caja)...")
-            matcheador.matcheo_multifacturas_misma_familia_dia_caja()
-            resultados = matcheador.resultados
+        print("\n2. Realizando matcheo sin espacios...")
+        matcheador.matcheo_sin_espacios()
+        
+        print("\n3. Realizando matcheo multi-facturas (misma familia + mismo día + misma caja)...")
+        matcheador.matcheo_multifacturas_misma_familia_dia_caja()
+        
+        # Opcional: otros matcheos que quieras mantener
+        # print("\n4. Realizando matcheo por grupo familiar...")
+        # matcheador.matcheo_por_grupo_familiar()
         
     except Exception as e:
         print(f"❌ ERROR durante el proceso: {str(e)}")
         return None
     
     # Generar reporte
-    if resultados is not None and len(resultados) > 0:
+    if matcheador.resultados is not None and len(matcheador.resultados) > 0:
         print("\nGenerando reporte...")
         matcheador.generar_reporte_completo('reporte_matches_completo.xlsx')
         
         # Mostrar estadísticas
         matcheador.estadisticas_detalladas()
     else:
-        print("No se encontraron matches exactos")
+        print("No se encontraron matches")
     
     return matcheador
 
@@ -1090,3 +1024,4 @@ def main():
 
 if __name__ == "__main__":
     exit(main())
+    
